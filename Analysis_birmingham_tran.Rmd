@@ -1,0 +1,262 @@
+---
+title: "Tracking the Purchase Card Transactions in Birmingham City Council"
+author: "Hugo Andres Dorado"
+date: "9/17/2021"
+output: html_document
+---
+
+
+
+# Introduction
+
+As part of transparent governance, many city councils have begun to publish transaction data. This practice is intended to ensure that resources are being used efficiently.  However, in many cases the data for monitoring is available, but because there is a lot of data it is difficult to validate that the management is being carried out correctly. Therefore, we will work with the assumption of a client, for example, an auditor who wants to analyze the dataset and detect that there is no overspending and is working with austerity policies.
+
+This report describes a methodology that will allow an auditor to detect anomalies on the transactions of purchases with the city council cards, with aim of detecting suspicious behavior in transactions. A data-driven approach based on two methodologies for anomalies detection was used in the practice. This is a study case with data from Birmingham City Council.
+ 
+# Dataset 
+
+The dataset contains records of card purchase transactions. This information is part of the data published by some city councils in order to demonstrate transparency in the management of government resources. The data comes from the Birmigham City Council. For this practice, only data from April 2014 to May 2018 were used. These years were selected because they are represent transactions in normal non-pandemic years. These variables were chosen because they were considered a priori representative; however, this is something that should be discussed with the clients. The dataset is open and can be found in <https://data.birmingham.gov.uk/dataset/purchase-card-transactions>.
+
+
+
+# Methodology
+
+
+The transactions time series was analyzed using two approaches to detect anomalies, the first was insolated trees, which has been a methodology used to analyze financial transactions <https://unit8.co/resources/a-guide-to-building-a-financial-transaction-anomaly-detector/>, and Seasonal and Trend Decomposition using Loess (STL), to visualize anomalies in time series <https://www.r-bloggers.com/2020/09/time-series-in-5-minutes-part-5-anomaly-detection/>. Although there are a large number of methods for this task, these two were selected after a web search of implemented cases of time series of banking transactions.
+
+Each of the methods employed has associated parameters, in the case of insolated trees it is required to specify the number of trees, and also the score to judge an observation as an anomaly. In the case of seasonal decomposition, an alpha must be assigned that measures the degree of stringency to detect observations with anomalies. Ideally, the data set of transaction records should have some cases classified as atypical or normal, which would facilitate the optimal choice of such parameters. For the purpose of this exercise, the default parameters of the software were used. However, for future studies, including a records classification of atypical transtactions, with this classification a rigorous tunning parameters process is recommended.
+
+
+# Results
+
+## Data pre-procesing
+
+Several R libraries were used in this exercise, for data reading `readxl` and `jsonlite`, for data processing `plyr`, `purr`, `ridyr` and `dplyr`, for anomaly detection models `solitude` and `timetk` and for graphics `ggplot2` and `gridExtra`.
+
+
+```{r setup, include=T,warning=FALSE,message=F}
+library(readxl)
+library(plyr)
+library(jsonlite)
+library(purrr)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+library(caret)
+library(dplyr)
+library(solitude)
+library(timetk)
+library(gridExtra)
+```
+
+
+Being separate datasets in different links, the api of the Bristom website <https://data.birmingham.gov.uk/dataset/purchase-card-transactions> was used and subsequently a JSON was generated, with which it was easier to extract in one set the URLs.
+
+
+```{r setup1, include=T,warning=FALSE,message=F,echo=T}
+json <- jsonlite::fromJSON("https://data.birmingham.gov.uk/api/3/action/package_search?q=Purchase%20Card%20transactions")
+
+dat <- json$result$results$resources[[1]][c("name","url")]
+
+```
+
+Afterwards, the information was downloaded into a local folder of the project.
+
+```{r setup2, include=T,warning=FALSE,message=F,eval=FALSE}
+
+ lapply(seq(length(dat$url)),function(w){
+  download.file(dat$url[w],destfile=paste0("Data/",dat$name[w],".xls"), mode = "wb")}
+ )
+```
+
+
+
+
+
+```{r setup3, include=T,warning=FALSE,message=F}
+ full_dataset <- lapply(list.files("Data/",full.names = T),read_xls)
+```
+
+
+```{r setup4, include=T,warning=FALSE,message=F,echo=T, results='hide'}
+ lapply(full_dataset, names)
+```
+
+
+A quick review of the headers of each dataset was performed, the one corresponding to December 2017 seems to report a different format from transactions then it was discarded. Some details were adjusted with the names and headers. Only three variables were chosen, these being transaction date, original gross amount, and transaction description. There are other variables that can complement the analysis, however, it would be ideal to discuss them with the client in order to detect which of them should be included.
+
+```{r setup5, include=T,warning=FALSE,message=F}
+full_dataset <- full_dataset[-13]
+
+full_ds <- do.call(rbind.fill,full_dataset)
+
+names(full_ds) <- gsub(" ","_",names(full_ds))
+
+full_ds$TRANS_DATE <- substring(full_ds$TRANS_DATE,1,10)
+
+full_ds$TRANS_DATE <- as.Date(full_ds$TRANS_DATE)
+
+full_ds <- full_ds %>% modify_if(is.character, as.factor) 
+
+head(full_ds[1:5])
+
+full_ds <- full_ds[complete.cases(full_ds[c("TRANS_DATE","ORIGINAL_GROSS_AMT","TRANS_CAC_DESC_1")]),]
+
+write.csv(full_ds,"consolidado.csv")
+```
+
+
+## Data processing
+
+In this step two important decisions were made, the first one, to remove some clearly extreme points highlighted in the boxplot, in order to have more homogeneity in the data. Transaction points greater than 25,000 pounds should be reviewed with the client to detect if they are errors or particular cases. On the other hand, taking into account that the objective is to detect atypical public expenses, in this case, the transactions whose monetary value is negative due to returns are not taken into account, clearly, this decision affects the analysis and should be reviewed with the client. However, we worked with the assumption that they should be discarded.
+
+
+```{r setup51, include=T,warning=FALSE,message=F}
+
+boxplot(full_ds$ORIGINAL_GROSS_AMT,ylab = "Pounds")
+
+full_ds <- full_ds[full_ds$ORIGINAL_GROSS_AMT>0,]
+
+full_ds <- full_ds[full_ds$ORIGINAL_GROSS_AMT<250000,]
+```
+
+
+## Feature engineering
+
+The variable description of the transaction has 144 categories, of which many of them have only one repetition, therefore this variable is modified by grouping categories with a frequency of less than 50.
+
+```{r setup6, include=T,warning=FALSE,message=F}
+highFreq <- full_ds %>% group_by(TRANS_CAC_DESC_1) %>% summarise(n=n()) %>% filter(n>=100) 
+
+full_ds$TRANS_CAC_DESC_1 <- as.character(full_ds$TRANS_CAC_DESC_1)
+
+full_ds$TRANS_CAC_DESC_1[!(full_ds$TRANS_CAC_DESC_1 %in% highFreq$TRANS_CAC_DESC_1 )] <- "Others"
+
+full_ds$TRANS_CAC_DESC_1 <- as.factor(full_ds$TRANS_CAC_DESC_1)
+
+summary(full_ds[,1:5])
+```
+
+Although the records are per transaction per day, the datasets do not have transaction hours which may also be an interesting variable. To work with a constant temporality it was aggregated the whole dataset in transactions per day, adding the transactions that were executed and counting the activity. 
+
+
+```{r setup7, include=T,warning=FALSE,message=F}
+full_ds %>% group_by(TRANS_DATE,TRANS_CAC_DESC_1 )  %>% summarise(n=n()) %>% arrange(desc(n))
+
+full_ds <- full_ds %>% group_by(TRANS_DATE,TRANS_CAC_DESC_1 )  %>% summarise(n=n(),tot=sum(ORIGINAL_GROSS_AMT))
+```
+
+Day of the week, day of the month and month were used as variables.
+
+```{r setup8, include=T,warning=FALSE,message=F}
+full_ds <- full_ds %>% pivot_wider( names_from = TRANS_CAC_DESC_1, values_from = n )
+
+full_ds <- aggregate(full_ds[,-1], list(TRANS_DATE=as.character(full_ds$TRANS_DATE)),sum,na.rm=T)
+
+full_ds$TRANS_DATE <- as.Date(full_ds$TRANS_DATE)
+
+full_ds <- full_ds %>% mutate(day = day(TRANS_DATE), month = month(TRANS_DATE), wday = wday(TRANS_DATE))
+```
+
+## Exploratory data analysis
+
+An exploratory data analysis was conducted to assess daily transaction trends. Line graphs and boxplots were used for this purpose. 
+
+
+
+
+```{r setup9, include=T,warning=FALSE,message=F}
+g1 <- ggplot(full_ds,aes(x=factor(wday),y=tot   ))+ylab("Transaction amount (pounds)")+xlab("Week day")+geom_boxplot()+theme_bw()
+
+g2 <- ggplot(full_ds,aes(x=factor(day),y=tot   ))+ylab("Transaction amount (pounds)")+xlab("Month day")+geom_boxplot()+theme_bw()
+
+g3 <- ggplot(full_ds,aes(x=factor(month),y=tot))+ylab("Transaction amount (pounds)")+xlab("Month")+geom_boxplot()+theme_bw()
+
+g4 <- ggplot(full_ds,aes(x=TRANS_DATE,y=tot ))+ylab("Transaction amount (pounds)")+xlab("Year")+geom_line()+theme_bw()
+
+grid.arrange(g4,g1,g2,g3,nrow=2,ncol=2)
+
+```
+
+
+
+The history of transactions per year shows some periods with high movements mainly at the end of 2017, while there are periods with low movements such as at the end of 2015 and the beginning of 2016. In addition, throughout all the years there are transactions with high values, some of them reach over 200,000 pounds.
+
+On the other hand, we observe that most transactions take place on weekdays and particularly on some days of the month such as the 15th and the 25th. In addition, the graph also shows that some months such as December the value of transactions decreases and there are fewer outliers. However, in general the rest of the months show similar distributions. 
+
+
+## Training model
+
+### Isolation forest
+
+
+Insolation forest is an unsupervised methodology, widely used in fraud detection, it has the advantage of not following assumptions about how an anomaly is recorded and does not require the data to be already classified. For our case this methodology would help us to detect transactions that are suspicious.
+
+```{r setup10, include=T,warning=FALSE,message=F}
+iso = isolationForest$new()
+
+iso$fit(full_ds)
+
+scores_train = full_ds %>%
+  iso$predict() %>%
+  arrange(desc(anomaly_score))
+  
+ggplot(scores_train,aes(x=anomaly_score)) +geom_histogram()+ geom_vline(xintercept = 0.612)
+```
+
+
+A threshold must be specified in the anomaly score value to consider a critical value to consider an observation as an anomaly. In this case a value of 0.615 was used, however this should preferably be calibrated with pre-classified validation data set.
+
+```{r setup101, include=T,warning=FALSE,message=F}
+
+full_ds$ID <- as.numeric(row.names(full_ds))
+
+join_scores_train <- data.frame(scores_train) %>%
+  right_join(full_ds,by = c("id"="ID"))
+
+head(join_scores_train[,1:5])
+
+join_scores_train$Anomaly <- join_scores_train$anomaly_score > 0.615
+
+join_scores_train %>% ggplot(aes(x=TRANS_DATE ,y=tot))+geom_line()+geom_point(aes(colour=Anomaly),size=1.5)+theme_bw()
+
+```
+
+An anomaly detection method based on STL Decomposition was also used, which consists of two steps, the first one removes the stationarity of the time series using STL decomposition, the second one constructs an interval of the resulting series based on interquartile range.In this case the variables year, days and transaction description were not used.
+
+
+### Anomaly Detection by STL Decomposition
+
+
+```{r setup11, include=T,warning=FALSE,message=F}
+full_ds %>%
+  plot_anomaly_diagnostics(TRANS_DATE, tot,
+                           .message = FALSE,
+                           .ribbon_alpha = 0.20,
+                           .interactive = FALSE)
+```
+
+
+Data sets with a variable that classifies transaction days as anomalous and normal based on the models outputs can be generated, and then facilitate the consultant's audit.
+
+# Conclusions
+
+A workflow was created to detect anomalies in Birmingham City Council card transactions, this tool will allow auditors and stakeholders to review suspicious transactions and monitor the proper use of public resources.
+
+Two machine learning methods were used, both of which showed great potential in detecting transaction anomalies, however, the dataset does not have a variable that confirms evidence of misuse in the management of the card, which does not allow comparing the efficiency of the models, nor optimizing parameters. 
+
+Throughout the period analyzed 2014-2018, the methods evidenced the presence of anomalies, these cases should be thoroughly analyzed to detect events of fraud, over public expenditures or mismanagement.
+
+# Recomendations
+
+It is suggested to the Birmingham City Council that a very detailed follow-up be carried out for a period of at least six months or a year, in which misuse of bank cards can be identified. This baseline can then be used to improve and optimize the model.
+
+
+# Bibliography
+
+* <https://data.birmingham.gov.uk/dataset/purchase-card-transactions>
+* <https://www.r-bloggers.com/2018/06/anomaly-detection-in-r-2/>
+* <https://unit8.co/resources/a-guide-to-building-a-financial-transaction-anomaly-detector/>
+* <https://rpubs.com/Joaquin_AR/614976>
+* <https://www.r-bloggers.com/2020/09/time-series-in-5-minutes-part-5-anomaly-detection/>
+
